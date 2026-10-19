@@ -1,3 +1,4 @@
-cam/grab
+/target
+/grab/target
 backup-*/
 *.apk

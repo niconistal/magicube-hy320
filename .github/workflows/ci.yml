@@ -1,0 +1,47 @@
+name: ci
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-24.04,     asset: magicube-linux-x86_64 }
+          - { os: ubuntu-24.04-arm, asset: magicube-linux-arm64 }
+          - { os: macos-14,         asset: magicube-macos-arm64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: armv7-unknown-linux-musleabihf
+          components: clippy
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev pkg-config
+      - run: cargo clippy --release -- -D warnings
+      - run: cargo test --release
+      - run: cargo build --release
+      - run: ./target/release/magicube --help
+      - run: cp target/release/magicube ${{ matrix.asset }}
+      - uses: actions/upload-artifact@v4
+        with: { name: '${{ matrix.asset }}', path: '${{ matrix.asset }}' }
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions: { contents: write }
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { merge-multiple: true }
+      - run: chmod +x magicube-* && sha256sum magicube-* > SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            magicube-*
+            SHA256SUMS

@@ -1,21 +1,21 @@
 # Gotchas
 
-Learned the hard way on a HY320 Pro. Most of these are baked into the scripts, but you should know them.
+Learned the hard way on a HY320 Pro. Most of these are handled by magicube, but you should know them.
 
 ## Never `adb reboot bootloader`
 
 The H726's U-Boot fastboot/efex mode drops off the USB A-A link and the box sits on the boot logo forever. Pulling power is the only way out, and after that it waits in standby until you press Power. **Slot B is empty** (all zeros), so there's no A/B fallback if slot A is damaged.
 
-- Reboot with plain `adb reboot` / `magicube reboot` (~15 s to boot).
+- Reboot with plain `adb reboot` / `magicube reboot` (~15 s to boot). magicube has no way to reboot to the bootloader.
 - If you need to flash a partition, use Android's userspace fastbootd: `adb reboot fastboot`.
 
 ## `adb shell su -c "a && b"` only runs `a` as root
 
-adb flattens the quoting, so `b` runs as the normal shell user and often fails silently (for example, the volume doesn't change). `magicube su` and the scripts push a small script and run `su -c "sh script"` instead.
+adb flattens the quoting, so `b` runs as the normal shell user and often fails silently (for example, the volume doesn't change). magicube pushes a small script and runs `su -c 'sh script'` instead.
 
 ## Screenshots lie about what's on the wall
 
-`screencap` captures the UI layer, but video plays on a separate hardware layer. If you force-stop the video player and immediately start it with a new file, the wall stays frozen on the **old** video while screenshots show the new one. `magicube play` goes HOME and waits 3 s first. To know what's actually projected, use the built-in camera (`magicube cam`) or an external webcam.
+`screencap` captures the UI layer, but video plays on a separate hardware layer. If you force-stop the video player and immediately start it with a new file, the wall stays frozen on the **old** video while screenshots show the new one. `magicube play` goes HOME and waits 3 s first. To know what's actually projected, use the built-in camera: `magicube see`, or `--verify` on `show`/`play`.
 
 ## The picture viewer ignores new pictures
 
@@ -39,8 +39,12 @@ Each `su` shows a small Magisk toast on the projected picture. If `su` hangs or 
 
 ## It may make noise
 
-A reboot can play a boot sound. The `reboot` command asks first.
+A reboot can play a boot sound. `magicube reboot` and the verify step in `setup` ask first. Looped videos are silent unless you pass `--sound`.
 
 ## The fingerprint is fake
 
 `getprop` reports a Rockchip `rk3566_rgo` fingerprint. That's a Play-certification spoof. The real platform is `ro.board.platform = sun50iw15p1` (Allwinner H726).
+
+## The camera needs manual exposure
+
+With auto exposure the frames come out blank. magicube sets it manually (default 130 ≈ a white wall at normal brightness; raise `--exposure` in a dark room). Each grab shows a small Magisk toast on the picture, which is harmless and small enough that `--verify` ignores it.
