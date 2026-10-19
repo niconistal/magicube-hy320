@@ -1,0 +1,178 @@
+#!/usr/bin/env bash
+# magicube — control a Magcubic HY320 Pro (Allwinner H726, Android 14) projector over adb.
+# Run `magicube help` for commands.
+set -euo pipefail
+# shellcheck source=lib.sh
+. "$(dirname "$(readlink -f "$0")")/lib.sh"
+
+usage() { cat <<'EOF'
+magicube <command> [args]
+
+  target [ip|serial]   show or set which projector to talk to (saved in ~/.config/magicube)
+  status               reachable? power, foreground app, uptime, IP, volume, root, launcher
+
+  show <image>         push a picture and show it full-screen (1920x1080 PNG/JPG looks best)
+  play <video.mp4>     push a video and play it in the built-in player
+  stop                 close the picture/video player and go home
+  home | back          press HOME / BACK
+  key <name|code>      send any key event (e.g. DPAD_UP, MEDIA_PLAY_PAUSE, 26)
+  text "<string>"      type text into the focused field
+  wake | sleep         turn the picture on / off (standby)
+
+  vol [0-15]           get or set media volume (setting needs root)
+  focus                run the built-in autofocus + auto keystone
+  keystone save <f>    save the keystone corners to a file
+  keystone load <f>    restore keystone corners from a file (needs root)
+  hdmi                 switch to the HDMI input
+  app <package>        launch an app        apps   list third-party apps
+
+  shot <out.png>       screenshot of the UI. NOT proof of what is projected (see docs/gotchas.md)
+  cam <out.pgm>        grab a frame from the built-in camera (needs root, cam/grab built)
+  shell [cmd]          adb shell        su "<cmd>"   run a command as root
+  reboot               normal reboot (never to the bootloader, see docs/gotchas.md)
+EOF
+}
+
+cmd="${1:-help}"; shift || true
+
+case "$cmd" in
+  help|-h|--help) usage ;;
+
+  target)
+    if [ $# -eq 0 ]; then mc_target; exit; fi
+    mkdir -p "$MC_CONF"; echo "$1" > "$MC_CONF/target"
+    mc_connect && echo "target set: $(mc_target)" ;;
+
+  status)
+    mc_connect
+    echo "target:     $(mc_target)"
+    echo "model:      $(SH getprop ro.product.model | tr -d '\r')  (Android $(SH getprop ro.build.version.release | tr -d '\r'))"
+    echo "power:      $(SH dumpsys power | grep -oE 'mWakefulness=[A-Za-z]+' | head -1 | cut -d= -f2)"
+    echo "foreground: $(SH dumpsys window | grep -m1 mCurrentFocus | sed -E 's/.* ([^ ]+)\}.*/\1/' | tr -d '\r')"
+    echo "uptime:     $(SH uptime | tr -d '\r' | sed -E 's/^ *//')"
+    echo "wifi ip:    $(SH ip -4 addr show wlan0 2>/dev/null | grep -oE 'inet [0-9.]+' | cut -d' ' -f2)"
+    echo "volume:     $(SH cmd media_session volume --stream 3 --get 2>/dev/null | grep -oE 'volume is [0-9]+' | grep -oE '[0-9]+$' || echo '?')"
+    echo "root:       $(has_root && echo yes || echo no)"
+    echo "launcher:   $(SH cmd package resolve-activity --brief -a android.intent.action.MAIN -c android.intent.category.HOME | tail -1 | tr -d '\r')" ;;
+
+  show)
+    [ $# -eq 1 ] && [ -f "$1" ] || die "usage: magicube show <image file>"
+    mc_connect
+    n="$(basename "$1")"; ext="${n##*.}"; mime="image/png"
+    case "${ext,,}" in jpg|jpeg) mime="image/jpeg" ;; esac
+    SH mkdir -p /sdcard/Pictures/magicube
+    A push "$1" "/sdcard/Pictures/magicube/$n" >/dev/null
+    # the viewer is singleTask: it ignores a new picture unless it is closed first
+    SH am force-stop com.softwinner.imageParser
+    SH am start -a android.intent.action.VIEW -d "file:///sdcard/Pictures/magicube/$n" -t "$mime" \
+       -n com.softwinner.imageParser/.MainActivity >/dev/null ;;
+
+  play)
+    [ $# -eq 1 ] && [ -f "$1" ] || die "usage: magicube play <video.mp4>"
+    mc_connect
+    n="$(basename "$1")"
+    A push "$1" "/sdcard/Movies/$n" >/dev/null
+    # Restarting the player right away freezes the hardware video layer on the previous
+    # clip (while screenshots show the new one). Go home and let it settle first.
+    SH "am force-stop com.softwinner.TvdVideo; am force-stop com.softwinner.imageParser; input keyevent 3"
+    sleep 3
+    SH am start -a android.intent.action.VIEW -d "file:///sdcard/Movies/$n" -t video/mp4 \
+       -n com.softwinner.TvdVideo/.TvdVideoActivity >/dev/null ;;
+
+  stop)
+    mc_connect
+    SH "am force-stop com.softwinner.TvdVideo; am force-stop com.softwinner.imageParser; input keyevent 3" ;;
+
+  home) mc_connect; SH input keyevent KEYCODE_HOME ;;
+  back) mc_connect; SH input keyevent KEYCODE_BACK ;;
+  wake) mc_connect; SH input keyevent KEYCODE_WAKEUP ;;
+  sleep) mc_connect; SH input keyevent KEYCODE_SLEEP ;;
+
+  key)
+    [ $# -eq 1 ] || die "usage: magicube key <name|code>"
+    mc_connect; k="$1"
+    [[ "$k" =~ ^[0-9]+$ || "$k" == KEYCODE_* ]] || k="KEYCODE_${k^^}"
+    SH input keyevent "$k" ;;
+
+  text)
+    [ $# -ge 1 ] || die "usage: magicube text \"<string>\""
+    mc_connect; SH input text "'${*// /%s}'" ;;
+
+  vol)
+    mc_connect
+    if [ $# -eq 0 ]; then
+      SH cmd media_session volume --stream 3 --get | grep -oE 'volume is [0-9]+.*' | tr -d '\r'
+    else
+      [[ "$1" =~ ^[0-9]+$ ]] || die "usage: magicube vol [0-15]"
+      # without root this silently does nothing on this firmware
+      need_root
+      SU "cmd media_session volume --stream 3 --set $1" >/dev/null
+      SH cmd media_session volume --stream 3 --get | grep -oE 'volume is [0-9]+' | tr -d '\r'
+    fi ;;
+
+  focus)
+    mc_connect
+    SH am start -n com.hysd.vafocus/.VajzActivity >/dev/null 2>&1 \
+      || SU "am start -n com.hysd.vafocus/.VajzActivity" >/dev/null ;;
+
+  keystone)
+    sub="${1:-}"; f="${2:-}"
+    [ -n "$sub" ] && [ -n "$f" ] || die "usage: magicube keystone save|load <file>"
+    mc_connect
+    case "$sub" in
+      save)
+        SH getprop | tr -d '\r' | grep -E '^\[persist\.display\.keystone' \
+          | sed -E 's/^\[([^]]+)\]: \[([^]]*)\]$/\1=\2/' > "$f"
+        echo "saved $(wc -l < "$f") values to $f" ;;
+      load)
+        [ -s "$f" ] || die "$f is empty or missing"
+        need_root
+        script=""
+        while IFS='=' read -r k v; do
+          [[ "$k" =~ ^persist\.display\.keystone[a-zA-Z0-9_.]*$ ]] || continue
+          script+="setprop $k '$v'"$'\n'
+        done < "$f"
+        SU "$script" >/dev/null
+        echo "restored. Reboot (magicube reboot) if the picture doesn't update." ;;
+      *) die "usage: magicube keystone save|load <file>" ;;
+    esac ;;
+
+  hdmi)
+    mc_connect
+    SH monkey -p com.android.toofifi -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1 \
+      || die "HDMI-in app (com.android.toofifi) didn't start — is it disabled?" ;;
+
+  app)
+    [ $# -eq 1 ] || die "usage: magicube app <package>"
+    mc_connect
+    SH monkey -p "$1" -c android.intent.category.LAUNCHER 1 2>&1 | grep -q 'Events injected' \
+      || SH monkey -p "$1" -c android.intent.category.LEANBACK_LAUNCHER 1 >/dev/null ;;
+
+  apps) mc_connect; SH pm list packages -3 | tr -d '\r' | sed 's/^package://' | sort ;;
+
+  shot)
+    [ $# -eq 1 ] || die "usage: magicube shot <out.png>"
+    mc_connect; A exec-out screencap -p > "$1"; echo "wrote $1 (UI only; see docs/gotchas.md)" ;;
+
+  cam)
+    [ $# -eq 1 ] || die "usage: magicube cam <out.pgm>"
+    bin="$MC_ROOT/cam/grab"
+    [ -x "$bin" ] || die "build the grabber first: make -C $MC_ROOT/cam"
+    mc_connect; need_root
+    A push "$bin" /data/local/tmp/mc-grab >/dev/null
+    SU "chmod 755 /data/local/tmp/mc-grab; /data/local/tmp/mc-grab /dev/video0 /data/local/tmp/mc-cam.pgm"
+    A pull /data/local/tmp/mc-cam.pgm "$1" >/dev/null && echo "wrote $1" ;;
+
+  shell) mc_connect; SH "$@" ;;
+  su) [ $# -ge 1 ] || die "usage: magicube su \"<cmd>\""; mc_connect; need_root; SU "$*" ;;
+
+  reboot)
+    mc_connect
+    read -r -p "Reboot the projector? It may play a boot sound. [y/N] " ok
+    [[ "$ok" =~ ^[yY] ]] || exit 0
+    # Plain reboot only. `adb reboot bootloader` drops USB and leaves the box stuck on the
+    # boot logo until you pull the power.
+    A reboot; sleep 10; wait_boot ;;
+
+  *) usage; exit 1 ;;
+esac
